@@ -1,30 +1,34 @@
 package com.ctrip.framework.apollo.portal.controller;
 
-import com.ctrip.framework.apollo.common.dto.AppNamespaceDTO;
-import com.ctrip.framework.apollo.common.utils.BeanUtils;
-import com.ctrip.framework.apollo.portal.component.PermissionValidator;
-import com.ctrip.framework.apollo.portal.listener.AppNamespaceDeletionEvent;
-import com.google.common.collect.Sets;
+import static com.ctrip.framework.apollo.common.utils.RequestPrecondition.checkModel;
 
+import com.ctrip.framework.apollo.common.dto.AppNamespaceDTO;
 import com.ctrip.framework.apollo.common.dto.NamespaceDTO;
 import com.ctrip.framework.apollo.common.entity.AppNamespace;
 import com.ctrip.framework.apollo.common.exception.BadRequestException;
+import com.ctrip.framework.apollo.common.http.MultiResponseEntity;
+import com.ctrip.framework.apollo.common.http.RichResponseEntity;
+import com.ctrip.framework.apollo.common.utils.BeanUtils;
 import com.ctrip.framework.apollo.common.utils.InputValidator;
 import com.ctrip.framework.apollo.common.utils.RequestPrecondition;
 import com.ctrip.framework.apollo.core.enums.Env;
+import com.ctrip.framework.apollo.portal.api.AdminServiceAPI;
+import com.ctrip.framework.apollo.portal.component.PermissionValidator;
 import com.ctrip.framework.apollo.portal.component.config.PortalConfig;
-import com.ctrip.framework.apollo.portal.constant.RoleType;
 import com.ctrip.framework.apollo.portal.entity.bo.NamespaceBO;
 import com.ctrip.framework.apollo.portal.entity.model.NamespaceCreationModel;
 import com.ctrip.framework.apollo.portal.listener.AppNamespaceCreationEvent;
+import com.ctrip.framework.apollo.portal.listener.AppNamespaceDeletionEvent;
 import com.ctrip.framework.apollo.portal.service.AppNamespaceService;
 import com.ctrip.framework.apollo.portal.service.NamespaceService;
 import com.ctrip.framework.apollo.portal.service.RoleInitializationService;
-import com.ctrip.framework.apollo.portal.service.RolePermissionService;
 import com.ctrip.framework.apollo.portal.spi.UserInfoHolder;
-import com.ctrip.framework.apollo.portal.util.RoleUtils;
 import com.ctrip.framework.apollo.tracer.Tracer;
-
+import com.google.common.collect.Sets;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.stream.Collectors;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -38,11 +42,6 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestMethod;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
-
-import java.util.List;
-import java.util.Map;
-
-import static com.ctrip.framework.apollo.common.utils.RequestPrecondition.checkModel;
 
 @RestController
 public class NamespaceController {
@@ -60,11 +59,11 @@ public class NamespaceController {
   @Autowired
   private RoleInitializationService roleInitializationService;
   @Autowired
-  private RolePermissionService rolePermissionService;
-  @Autowired
   private PortalConfig portalConfig;
   @Autowired
   private PermissionValidator permissionValidator;
+  @Autowired
+  private AdminServiceAPI.NamespaceAPI namespaceAPI;
 
 
   @RequestMapping(value = "/appnamespaces/public", method = RequestMethod.GET)
@@ -138,7 +137,7 @@ public class NamespaceController {
       }
     }
 
-    assignNamespaceRoleToOperator(appId, namespaceName);
+    namespaceService.assignNamespaceRoleToOperator(appId, namespaceName,userInfoHolder.getUser().getUserId());
 
     return ResponseEntity.ok().build();
   }
@@ -173,7 +172,7 @@ public class NamespaceController {
           String.format("AppNamespace not exists. AppId = %s, NamespaceName = %s", appId, namespaceName));
     }
 
-    return BeanUtils.transfrom(AppNamespaceDTO.class, appNamespace);
+    return BeanUtils.transform(AppNamespaceDTO.class, appNamespace);
   }
 
   @PreAuthorize(value = "@permissionValidator.hasCreateAppNamespacePermission(#appId, #appNamespace)")
@@ -192,7 +191,8 @@ public class NamespaceController {
     AppNamespace createdAppNamespace = appNamespaceService.createAppNamespaceInLocal(appNamespace, appendNamespacePrefix);
 
     if (portalConfig.canAppAdminCreatePrivateNamespace() || createdAppNamespace.isPublic()) {
-      assignNamespaceRoleToOperator(appId, appNamespace.getName());
+      namespaceService.assignNamespaceRoleToOperator(appId, appNamespace.getName(),
+          userInfoHolder.getUser().getUserId());
     }
 
     publisher.publishEvent(new AppNamespaceCreationEvent(createdAppNamespace));
@@ -222,15 +222,57 @@ public class NamespaceController {
 
   }
 
-  private void assignNamespaceRoleToOperator(String appId, String namespaceName) {
-    //default assign modify、release namespace role to namespace creator
-    String operator = userInfoHolder.getUser().getUserId();
+  @RequestMapping(value = "/apps/{appId}/envs/{env}/clusters/{clusterName}/missing-namespaces", method = RequestMethod.GET)
+  public MultiResponseEntity<String> findMissingNamespaces(@PathVariable String appId, @PathVariable String env, @PathVariable String clusterName) {
 
-    rolePermissionService
-        .assignRoleToUsers(RoleUtils.buildNamespaceRoleName(appId, namespaceName, RoleType.MODIFY_NAMESPACE),
-                           Sets.newHashSet(operator), operator);
-    rolePermissionService
-        .assignRoleToUsers(RoleUtils.buildNamespaceRoleName(appId, namespaceName, RoleType.RELEASE_NAMESPACE),
-                           Sets.newHashSet(operator), operator);
+    MultiResponseEntity<String> response = MultiResponseEntity.ok();
+
+    Set<String> missingNamespaces = findMissingNamespaceNames(appId, env, clusterName);
+
+    for (String missingNamespace : missingNamespaces) {
+      response.addResponseEntity(RichResponseEntity.ok(missingNamespace));
+    }
+
+    return response;
+  }
+
+  @RequestMapping(value = "/apps/{appId}/envs/{env}/clusters/{clusterName}/missing-namespaces", method = RequestMethod.POST)
+  public ResponseEntity<Void> createMissingNamespaces(@PathVariable String appId, @PathVariable String env, @PathVariable String clusterName) {
+
+    Set<String> missingNamespaces = findMissingNamespaceNames(appId, env, clusterName);
+
+    for (String missingNamespace : missingNamespaces) {
+      namespaceAPI.createMissingAppNamespace(Env.fromString(env), findAppNamespace(appId, missingNamespace));
+    }
+
+    return ResponseEntity.ok().build();
+  }
+
+  private Set<String> findMissingNamespaceNames(String appId, String env, String clusterName) {
+    List<AppNamespaceDTO> configDbAppNamespaces = namespaceAPI.getAppNamespaces(appId, Env.fromString(env));
+    List<NamespaceDTO> configDbNamespaces = namespaceService.findNamespaces(appId, Env.fromString(env), clusterName);
+    List<AppNamespace> portalDbAppNamespaces = appNamespaceService.findByAppId(appId);
+
+    Set<String> configDbAppNamespaceNames = configDbAppNamespaces.stream().map(AppNamespaceDTO::getName)
+            .collect(Collectors.toSet());
+    Set<String> configDbNamespaceNames = configDbNamespaces.stream().map(NamespaceDTO::getNamespaceName)
+        .collect(Collectors.toSet());
+
+    Set<String> portalDbAllAppNamespaceNames = Sets.newHashSet();
+    Set<String> portalDbPrivateAppNamespaceNames = Sets.newHashSet();
+
+    for (AppNamespace appNamespace : portalDbAppNamespaces) {
+      portalDbAllAppNamespaceNames.add(appNamespace.getName());
+      if (!appNamespace.isPublic()) {
+        portalDbPrivateAppNamespaceNames.add(appNamespace.getName());
+      }
+    }
+
+    // AppNamespaces should be the same
+    Set<String> missingAppNamespaceNames = Sets.difference(portalDbAllAppNamespaceNames, configDbAppNamespaceNames);
+    // Private namespaces should all exist
+    Set<String> missingNamespaceNames = Sets.difference(portalDbPrivateAppNamespaceNames, configDbNamespaceNames);
+
+    return Sets.union(missingAppNamespaceNames, missingNamespaceNames);
   }
 }
